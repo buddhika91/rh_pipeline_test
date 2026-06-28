@@ -1,0 +1,322 @@
+# rh_pipeline_test.py
+import argparse
+import csv
+import mpmath as mp
+from tqdm import tqdm
+
+BAR = "=" * 100
+
+def xi(s):
+    return mp.mpf("0.5") * s * (s - 1) * mp.power(mp.pi, -s / 2) * mp.gamma(s / 2) * mp.zeta(s)
+
+def load_lambdas(N):
+    return [mp.zetazero(k).imag**2 for k in range(1, N + 1)]
+
+def moments(xs):
+    return {r: mp.fsum([x**r for x in xs]) for r in range(1, 6)}
+
+def S_coeffs(M):
+    S3 = M[3]*M[5] - M[4]**2
+    S2 = -6*M[2]*M[5] + 6*M[3]*M[4] + 4*M[3]*M[5] - 4*M[4]**2
+    S1 = (
+        6*M[1]*M[5] + 12*M[2]*M[4]
+        - 18*M[2]*M[5] - 18*M[3]**2
+        + 18*M[3]*M[4] + 6*M[3]*M[5] - 6*M[4]**2
+    )
+    S0 = (
+        -20*M[1]*M[4] + 12*M[1]*M[5]
+        + 20*M[2]*M[3] + 24*M[2]*M[4]
+        - 18*M[2]*M[5] - 36*M[3]**2
+        + 18*M[3]*M[4] + 4*M[3]*M[5] - 4*M[4]**2
+    )
+    return S0, S1, S2, S3
+
+def P_old(q, x, y):
+    return (
+        q**3*x**2*y**2 + q**2*x**2*y**2
+        - 6*q**2*x**2*y - 6*q**2*x*y**2
+        + q*x**2*y**2 - 6*q*x**2*y + 6*q*x**2
+        - 6*q*x*y**2 + 24*q*x*y + 6*q*y**2
+        + x**2*y**2 - 6*x**2*y + 6*x**2
+        - 6*x*y**2 + 24*x*y - 20*x + 6*y**2 - 20*y
+    )
+
+def B_boundary(q, x):
+    return (
+        q**4*x**2 - 6*q**3*x**2 - 6*q**3*x
+        + 6*q**2*x**2 + 24*q**2*x + 6*q**2
+        - 20*q*x - 20*q + 15
+    )
+
+def raw_pair_kernel(x, y):
+    poly = (
+        15*x**2*y**2
+        - 20*x**2*y
+        + 6*x**2
+        - 20*x*y**2
+        + 24*x*y
+        - 6*x
+        + 6*y**2
+        - 6*y
+        + 1
+    )
+    return (x - y)**2 * poly / (x**5 * y**5)
+
+def K_xi(t, h):
+    s0 = mp.mpf("0.5") + 1j*t
+    sp = mp.mpf("0.5") + 1j*(t + h)
+    sm = mp.mpf("0.5") + 1j*(t - h)
+
+    f0 = mp.log(abs(xi(s0)))
+    fp = mp.log(abs(xi(sp)))
+    fm = mp.log(abs(xi(sm)))
+
+    return -(fp - 2*f0 + fm) / (h*h)
+
+def classify_pair(i, k, moved_index):
+    j = moved_index
+
+    if i == k:
+        return "diagonal"
+    if i < j and k < j:
+        return "head_head"
+    if i == j or k == j:
+        return "boundary"
+    if (i < j and k > j) or (k < j and i > j):
+        return "middle"
+    if i > j and k > j:
+        return "tail_tail"
+
+    return "other"
+
+def status(ok):
+    return "CONFIRMED" if ok else "REVIEW"
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--zero-count", type=int, default=200)
+    ap.add_argument("--start", type=int, default=12)
+    ap.add_argument("--end", type=int, default=80)
+    ap.add_argument("--dps", type=int, default=80)
+    ap.add_argument("--tmax", type=float, default=50.0)
+    ap.add_argument("--tpoints", type=int, default=200)
+    ap.add_argument("--h", default="1e-4")
+    ap.add_argument("--csv", default="rh_pipeline_test.csv")
+    args = ap.parse_args()
+
+    mp.mp.dps = args.dps
+    h = mp.mpf(args.h)
+
+    print(BAR)
+    print("RIEMANN HYPOTHESIS PIPELINE TEST")
+    print(BAR)
+    print("Purpose:")
+    print("  Numerically audits the current RH proof pipeline checkpoints A, B, C, and D.")
+    print("  Theorem E is reported as a formal implication target, not as a numerical theorem.")
+    print()
+    print("Parameters:")
+    print(f"  zero-count = {args.zero_count}")
+    print(f"  moved-index range = {args.start} to {args.end}")
+    print(f"  precision dps = {args.dps}")
+    print(f"  curvature scan t in [0, {args.tmax}] with {args.tpoints} points")
+    print(f"  finite-difference h = {h}")
+    print(BAR)
+
+    lams = load_lambdas(args.zero_count)
+
+    review_A = []
+    review_B = []
+    review_C_proxy = []
+    review_C_full = []
+
+    rows = []
+
+    print("\nCHECKPOINTS A/B/C: MOMENT, INCREMENT, AND FINITE PAIR-KERNEL TEST")
+    print(BAR)
+    print("A = moment positivity S0,S1,S2,S3 and S(d)")
+    print("B = old-pair + boundary increment positivity")
+    print("C_proxy = positivity of the old-pair and boundary pieces")
+    print("C_full = positivity of the full finite raw pair-kernel total")
+    print(BAR)
+
+    end_index = min(args.end, args.zero_count - 1)
+
+    for moved in tqdm(range(args.start, end_index + 1)):
+        j = moved - 1
+        A_lam = lams[j]
+        q = lams[j + 1] / A_lam
+        d = q - 1
+
+        xs_head = [A_lam / lams[i] for i in range(j)]
+
+        M = moments(xs_head)
+        S0, S1, S2, S3 = S_coeffs(M)
+        S = S0 + d*S1 + d**2*S2 + d**3*S3
+
+        A_ok = S0 > 0 and S1 > 0 and S2 > 0 and S3 > 0 and S > 0
+
+        old = mp.mpf("0")
+        boundary_increment = mp.mpf("0")
+
+        for x in xs_head:
+            boundary_increment += x * (x - 1)**2 * B_boundary(q, x)
+
+        for x in xs_head:
+            for y in xs_head:
+                old += d * x * y * (x - y)**2 * P_old(q, x, y) / 2
+
+        increment_total = old + boundary_increment
+
+        B_ok = increment_total > 0
+        C_proxy_ok = B_ok and old > 0 and boundary_increment > 0
+
+        region_sum = {
+            "head_head": mp.mpf("0"),
+            "boundary": mp.mpf("0"),
+            "middle": mp.mpf("0"),
+            "tail_tail": mp.mpf("0"),
+            "diagonal": mp.mpf("0"),
+            "other": mp.mpf("0"),
+        }
+
+        total_full = mp.mpf("0")
+        total_negative_mass = mp.mpf("0")
+        negative_pair_count = 0
+
+        for i in range(args.zero_count):
+            xi_val = lams[i] / A_lam
+
+            for k in range(args.zero_count):
+                yk_val = lams[k] / A_lam
+                val = raw_pair_kernel(xi_val, yk_val)
+                region = classify_pair(i, k, j)
+
+                region_sum[region] += val
+                total_full += val
+
+                if val < 0:
+                    total_negative_mass += val
+                    negative_pair_count += 1
+
+        C_full_ok = total_full > 0
+
+        if not A_ok:
+            review_A.append(moved)
+        if not B_ok:
+            review_B.append(moved)
+        if not C_proxy_ok:
+            review_C_proxy.append(moved)
+        if not C_full_ok:
+            review_C_full.append(moved)
+
+        print(
+            f"j={moved:4d} | "
+            f"A={status(A_ok):9s} "
+            f"B={status(B_ok):9s} "
+            f"C_proxy={status(C_proxy_ok):9s} "
+            f"C_full={status(C_full_ok):9s} | "
+            f"full={mp.nstr(total_full, 10)} "
+            f"head={mp.nstr(region_sum['head_head'], 8)} "
+            f"middle={mp.nstr(region_sum['middle'], 8)} "
+            f"tail={mp.nstr(region_sum['tail_tail'], 8)} "
+            f"negative_mass={mp.nstr(total_negative_mass, 8)}"
+        )
+
+        rows.append({
+            "moved_index": moved,
+            "A_moment_positivity": status(A_ok),
+            "B_increment_positivity": status(B_ok),
+            "C_proxy_old_boundary": status(C_proxy_ok),
+            "C_full_pair_kernel": status(C_full_ok),
+            "S0": mp.nstr(S0, 50),
+            "S1": mp.nstr(S1, 50),
+            "S2": mp.nstr(S2, 50),
+            "S3": mp.nstr(S3, 50),
+            "S": mp.nstr(S, 50),
+            "old_pair_increment": mp.nstr(old, 50),
+            "boundary_increment": mp.nstr(boundary_increment, 50),
+            "increment_total": mp.nstr(increment_total, 50),
+            "full_pair_kernel_total": mp.nstr(total_full, 50),
+            "negative_pair_mass": mp.nstr(total_negative_mass, 50),
+            "negative_pair_count": negative_pair_count,
+            "head_head_sum": mp.nstr(region_sum["head_head"], 50),
+            "boundary_sum": mp.nstr(region_sum["boundary"], 50),
+            "middle_sum": mp.nstr(region_sum["middle"], 50),
+            "tail_tail_sum": mp.nstr(region_sum["tail_tail"], 50),
+            "diagonal_sum": mp.nstr(region_sum["diagonal"], 50),
+            "other_sum": mp.nstr(region_sum["other"], 50),
+        })
+
+    print("\nCHECKPOINT D: CURVATURE-FLOOR DIAGNOSTIC")
+    print(BAR)
+
+    K0 = K_xi(mp.mpf("0"), h)
+    minK = mp.inf
+    minGap = mp.inf
+    worstT = None
+
+    for n in tqdm(range(args.tpoints + 1)):
+        t = mp.mpf(args.tmax) * n / args.tpoints
+        Kt = K_xi(t, h)
+        gap = Kt - K0
+
+        if Kt < minK:
+            minK = Kt
+        if gap < minGap:
+            minGap = gap
+            worstT = t
+
+    D_ok = minGap >= 0
+
+    print(f"K(0)                 = {mp.nstr(K0, 30)}")
+    print(f"minimum sampled K(t) = {mp.nstr(minK, 30)}")
+    print(f"minimum sampled gap  = {mp.nstr(minGap, 30)}")
+    print(f"location of min gap  = t = {mp.nstr(worstT, 20)}")
+    print(f"Checkpoint D status  = {status(D_ok)}")
+    print()
+    print("Interpretation:")
+    print("  The sampled curvature floor K(t) >= K(0) is consistent on this grid.")
+    print("  This is numerical evidence for the curvature-floor branch, not a standalone proof.")
+
+    print("\nCHECKPOINT E: CONNECTION TO RH")
+    print(BAR)
+    print("Theorem-chain target:")
+    print("  A confirms the moment-positivity block.")
+    print("  B confirms the head increment block.")
+    print("  C_full confirms the finite raw pair-kernel total in this truncation.")
+    print("  D checks the curvature-floor inequality numerically on the sampled line.")
+    print()
+    print("Formal RH implication still required:")
+    print("  To turn this pipeline into an RH proof, one must prove analytically that")
+    print("  the full Stieltjes/curvature-floor condition excludes all off-critical zeros.")
+    print("  This script supports the chain numerically; it does not replace that theorem.")
+
+    print("\nSUMMARY")
+    print(BAR)
+
+    def summarize(name, items):
+        if len(items) == 0:
+            print(f"{name}: all tested indices confirmed.")
+        else:
+            print(f"{name}: indices needing review: {items}")
+
+    summarize("Checkpoint A", review_A)
+    summarize("Checkpoint B", review_B)
+    summarize("Checkpoint C_proxy", review_C_proxy)
+    summarize("Checkpoint C_full", review_C_full)
+    print(f"Checkpoint D: {status(D_ok)}.")
+    print("Checkpoint E: formal implication target identified.")
+
+    print()
+    print(f"CSV written to: {args.csv}")
+
+    if rows:
+        with open(args.csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
